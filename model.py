@@ -170,13 +170,18 @@ def train(
     train_loader: DataLoader,
     val_loader: DataLoader,
     device: torch.device,
-    epochs: int = 50,
+    epochs: int = 10,
     lr: float = 3e-4,
     weight_decay: float = 0.01,
     gradient_clip: float = 1.0,
     use_wandb: bool = False,
+    vocab: 'CharVocab' = None,
+    sample_seed: str = "The ",
 ) -> tuple[ChainableMarkovModel, dict]:
-    """Training loop with cosine annealing LR schedule. Returns model and history."""
+    """Training loop with cosine annealing LR schedule. Returns model and history.
+
+    If vocab is provided, generates sample text at each epoch end.
+    """
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -264,8 +269,37 @@ def train(
               f"Val Loss: {avg_val_loss:.4f} | "
               f"LR: {current_lr:.6f}")
 
+        # Generate sample text at end of each epoch
+        if vocab is not None:
+            sample = _generate_sample(model, vocab, sample_seed, max_length=100, device=device)
+            print(f"  Sample: {sample[:80]}...")
+            if wandb:
+                wandb.log({'sample_text': wandb.Html(f'<pre>{sample}</pre>'), 'epoch': epoch + 1})
+
     model.load_state_dict(torch.load('markov_model_best.pt', weights_only=True))
     return model, history
+
+
+def _generate_sample(model, vocab, seed, max_length=100, temperature=0.8, device=torch.device('cpu')):
+    """Quick generation for training samples."""
+    model.eval()
+    tokens = vocab.encode(seed)
+    embeddings = model.embed(torch.tensor(tokens, dtype=torch.long, device=device))
+    latent = embeddings[0]
+    for i in range(1, len(tokens)):
+        latent = model.compose_latents(latent, embeddings[i])
+
+    generated = list(seed)
+    for _ in range(max_length):
+        logits = model.decode(latent) / temperature
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, 1).item()
+        generated.append(vocab.idx_to_char[next_token])
+        next_embedding = model.embed(torch.tensor([next_token], dtype=torch.long, device=device))[0]
+        latent = model.compose_latents(latent, next_embedding)
+
+    model.train()
+    return ''.join(generated)
 
 
 @torch.no_grad()
