@@ -183,28 +183,36 @@ def _log_composition_heatmaps(model, vocab, labels, wandb, epoch, device):
         import torch
 
         vocab_size = vocab.vocab_size
-
-        # Get all embeddings with position 0 and 1 for bigrams
         all_ids = torch.arange(vocab_size, device=device)
-        token_emb = model.embed(all_ids)  # (vocab_size, d_latent)
+        is_additive = isinstance(model, AdditiveMarkovModel)
 
-        # Position embeddings for position 0 (first char) and position 1 (second char)
-        pos_0 = model.pos_embedding(torch.tensor([0], device=device))  # (1, d_latent)
-        pos_1 = model.pos_embedding(torch.tensor([1], device=device))  # (1, d_latent)
-
-        emb_pos0 = token_emb + pos_0  # All chars at position 0
-        emb_pos1 = token_emb + pos_1  # All chars at position 1
+        if is_additive:
+            # AdditiveMarkovModel: use position-specific embeddings
+            emb_pos0 = model.pos_embeddings[0](all_ids)  # All chars at position 0
+            emb_pos1 = model.pos_embeddings[1](all_ids)  # All chars at position 1
+        else:
+            # ChainableMarkovModel: token embedding + position embedding
+            token_emb = model.embed(all_ids)
+            pos_0 = model.pos_embedding(torch.tensor([0], device=device))
+            pos_1 = model.pos_embedding(torch.tensor([1], device=device))
+            emb_pos0 = token_emb + pos_0
+            emb_pos1 = token_emb + pos_1
 
         # Compute compose(i, j) for all pairs and get predictions
-        # This creates a vocab_size x vocab_size grid
         predictions = np.zeros((vocab_size, vocab_size), dtype=np.int32)
         confidences = np.zeros((vocab_size, vocab_size), dtype=np.float32)
 
         for i in range(vocab_size):
-            # Batch process: compose embedding[i] at pos 0 with all embeddings at pos 1
             emb_i = emb_pos0[i].unsqueeze(0).expand(vocab_size, -1)  # (vocab_size, d_latent)
-            composed = model.compose_latents(emb_i, emb_pos1)  # (vocab_size, d_latent)
-            logits = model.decode(composed)  # (vocab_size, vocab_size)
+
+            if is_additive:
+                # Additive: just sum and normalize
+                composed = model.latent_norm(emb_i + emb_pos1)
+            else:
+                # Chainable: use compose_latents
+                composed = model.compose_latents(emb_i, emb_pos1)
+
+            logits = model.decode(composed)
             probs = torch.softmax(logits, dim=-1)
 
             predictions[i] = logits.argmax(dim=-1).cpu().numpy()
@@ -461,6 +469,143 @@ class ChainableMarkovModel(nn.Module):
         return self.decode(latent)
 
 
+class AdditiveMarkovModel(nn.Module):
+    """
+    Simpler alternative: Position-specific embeddings with additive composition.
+
+    Instead of learning compose(a, b) = MLP([a; b]), we simply sum position-specific
+    embeddings. This avoids the information bottleneck of repeated compression.
+
+    For tokens [t1, t2, t3, t4]:
+        latent = embed_0(t1) + embed_1(t2) + embed_2(t3) + embed_3(t4)
+        output = decode(latent)
+
+    Chainable: To extend, just add embed_n(t_new) to existing latent.
+
+    Benefits:
+    - No information loss (additive, not compressive)
+    - Position-aware by design (separate embeddings per position)
+    - Much simpler - easier to optimize
+    - Fewer parameters than chained MLP approach
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_latent: int = 128,
+        d_hidden: int = 512,
+        dropout: float = 0.1,
+        max_positions: int = 16,
+    ):
+        super().__init__()
+        self.d_latent = d_latent
+        self.vocab_size = vocab_size
+        self.max_positions = max_positions
+
+        # Position-specific embeddings: each position has its own embedding matrix
+        self.pos_embeddings = nn.ModuleList([
+            nn.Embedding(vocab_size, d_latent) for _ in range(max_positions)
+        ])
+
+        # Shared embedding for positions beyond max (fallback for generation)
+        self.fallback_embedding = nn.Embedding(vocab_size, d_latent)
+
+        # Layer norm after summing (stabilizes training)
+        self.latent_norm = nn.LayerNorm(d_latent)
+
+        # Decoder: latent → vocab logits
+        # Using a small MLP decoder for expressiveness
+        self.decoder = nn.Sequential(
+            nn.Linear(d_latent, d_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden, d_latent),
+        )
+        self.decoder_out = nn.Linear(d_latent, vocab_size, bias=False)
+        # Weight tying with position 0 embedding (arbitrary choice, helps generalization)
+        self.decoder_out.weight = self.pos_embeddings[0].weight
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Embed using position 0 embedding (for compatibility)."""
+        return self.pos_embeddings[0](token_ids)
+
+    def embed_at_position(self, token_ids: torch.Tensor, position: int) -> torch.Tensor:
+        """Embed tokens at a specific position."""
+        if position < self.max_positions:
+            return self.pos_embeddings[position](token_ids)
+        else:
+            return self.fallback_embedding(token_ids)
+
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode latent to vocabulary logits."""
+        hidden = self.decoder(latent)
+        return self.decoder_out(hidden)
+
+    def forward_chain(self, token_sequences: list[list[int]], device: torch.device) -> torch.Tensor:
+        """
+        Additive forward pass - sum position-specific embeddings.
+
+        Much simpler than chained composition: just sum embeddings at each position.
+        """
+        batch_size = len(token_sequences)
+        lengths = [len(seq) for seq in token_sequences]
+        max_len = max(lengths)
+
+        # Initialize latent as zeros
+        latent = torch.zeros(batch_size, self.d_latent, device=device)
+
+        # Pad sequences
+        padded = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        for i, seq in enumerate(token_sequences):
+            padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+
+        # Create mask for valid positions
+        lengths_t = torch.tensor(lengths, device=device)
+
+        # Sum position-specific embeddings
+        for pos in range(max_len):
+            # Get embedding for this position
+            if pos < self.max_positions:
+                pos_emb = self.pos_embeddings[pos](padded[:, pos])  # (batch, d_latent)
+            else:
+                pos_emb = self.fallback_embedding(padded[:, pos])
+
+            # Mask: only add for sequences that have this position
+            mask = (pos < lengths_t).unsqueeze(-1).float()  # (batch, 1)
+            latent = latent + pos_emb * mask
+
+        # Normalize the summed latent
+        latent = self.latent_norm(latent)
+
+        return latent
+
+    def forward(self, token_sequences: list[list[int]], device: torch.device) -> torch.Tensor:
+        """Full forward pass: sum embeddings and decode."""
+        latent = self.forward_chain(token_sequences, device)
+        return self.decode(latent)
+
+    # For compatibility with visualization code
+    @property
+    def pos_embedding(self):
+        """Dummy property for visualization compatibility."""
+        return self.pos_embeddings[0]
+
+    def compose_latents(self, latent1: torch.Tensor, latent2: torch.Tensor) -> torch.Tensor:
+        """For compatibility - just adds latent2 to latent1."""
+        return self.latent_norm(latent1 + latent2)
+
+
 def train(
     model: ChainableMarkovModel,
     train_loader: DataLoader,
@@ -580,23 +725,31 @@ def train(
 
 
 def _generate_sample(model, vocab, seed, max_length=100, temperature=0.8, device=torch.device('cpu')):
-    """Quick generation for training samples."""
+    """Quick generation for training samples. Works with both model types."""
     model.eval()
     tokens = vocab.encode(seed)
-    token_ids = torch.tensor(tokens, dtype=torch.long, device=device)
-    positions = torch.arange(len(tokens), device=device)
+    is_additive = isinstance(model, AdditiveMarkovModel)
 
-    # Add positional embeddings to token embeddings
-    token_emb = model.embed(token_ids)
-    pos_emb = model.pos_embedding(positions)
-    embeddings = token_emb + pos_emb
-
-    latent = embeddings[0]
-    for i in range(1, len(tokens)):
-        latent = model.compose_latents(latent, embeddings[i])
+    if is_additive:
+        # AdditiveMarkovModel: use position-specific embeddings directly
+        latent = torch.zeros(model.d_latent, device=device)
+        for i, tok in enumerate(tokens):
+            tok_t = torch.tensor([tok], dtype=torch.long, device=device)
+            latent = latent + model.embed_at_position(tok_t, i)[0]
+        latent = model.latent_norm(latent)
+    else:
+        # ChainableMarkovModel: use positional embeddings added to token embeddings
+        token_ids = torch.tensor(tokens, dtype=torch.long, device=device)
+        positions = torch.arange(len(tokens), device=device)
+        token_emb = model.embed(token_ids)
+        pos_emb = model.pos_embedding(positions)
+        embeddings = token_emb + pos_emb
+        latent = embeddings[0]
+        for i in range(1, len(tokens)):
+            latent = model.compose_latents(latent, embeddings[i])
 
     generated = list(seed)
-    current_pos = len(tokens)  # Track position for new tokens
+    current_pos = len(tokens)
 
     for _ in range(max_length):
         logits = model.decode(latent) / temperature
@@ -604,13 +757,18 @@ def _generate_sample(model, vocab, seed, max_length=100, temperature=0.8, device
         next_token = torch.multinomial(probs, 1).item()
         generated.append(vocab.idx_to_char[next_token])
 
-        # Add position embedding to next token (clamped to max_positions)
-        pos_idx = min(current_pos, model.pos_embedding.num_embeddings - 1)
-        next_token_emb = model.embed(torch.tensor([next_token], dtype=torch.long, device=device))[0]
-        next_pos_emb = model.pos_embedding(torch.tensor([pos_idx], device=device))[0]
-        next_embedding = next_token_emb + next_pos_emb
+        # Get embedding for next token at current position
+        next_tok_t = torch.tensor([next_token], dtype=torch.long, device=device)
+        if is_additive:
+            next_embedding = model.embed_at_position(next_tok_t, current_pos)[0]
+            latent = model.latent_norm(latent + next_embedding)
+        else:
+            pos_idx = min(current_pos, model.pos_embedding.num_embeddings - 1)
+            next_token_emb = model.embed(next_tok_t)[0]
+            next_pos_emb = model.pos_embedding(torch.tensor([pos_idx], device=device))[0]
+            next_embedding = next_token_emb + next_pos_emb
+            latent = model.compose_latents(latent, next_embedding)
 
-        latent = model.compose_latents(latent, next_embedding)
         current_pos += 1
 
     model.train()
@@ -619,7 +777,7 @@ def _generate_sample(model, vocab, seed, max_length=100, temperature=0.8, device
 
 @torch.no_grad()
 def generate(
-    model: ChainableMarkovModel,
+    model,  # ChainableMarkovModel or AdditiveMarkovModel
     vocab: CharVocab,
     seed: str,
     max_length: int = 200,
@@ -627,20 +785,28 @@ def generate(
     top_p: float = 0.9,
     device: torch.device = torch.device('cpu'),
 ) -> str:
-    """Generate text using temperature and nucleus sampling."""
+    """Generate text using temperature and nucleus sampling. Works with both model types."""
     model.eval()
     tokens = vocab.encode(seed)
-    token_ids = torch.tensor(tokens, dtype=torch.long, device=device)
-    positions = torch.arange(len(tokens), device=device)
+    is_additive = isinstance(model, AdditiveMarkovModel)
 
-    # Add positional embeddings
-    token_emb = model.embed(token_ids)
-    pos_emb = model.pos_embedding(positions)
-    embeddings = token_emb + pos_emb
-
-    latent = embeddings[0]
-    for i in range(1, len(tokens)):
-        latent = model.compose_latents(latent, embeddings[i])
+    if is_additive:
+        # AdditiveMarkovModel: sum position-specific embeddings
+        latent = torch.zeros(model.d_latent, device=device)
+        for i, tok in enumerate(tokens):
+            tok_t = torch.tensor([tok], dtype=torch.long, device=device)
+            latent = latent + model.embed_at_position(tok_t, i)[0]
+        latent = model.latent_norm(latent)
+    else:
+        # ChainableMarkovModel: compose with positional embeddings
+        token_ids = torch.tensor(tokens, dtype=torch.long, device=device)
+        positions = torch.arange(len(tokens), device=device)
+        token_emb = model.embed(token_ids)
+        pos_emb = model.pos_embedding(positions)
+        embeddings = token_emb + pos_emb
+        latent = embeddings[0]
+        for i in range(1, len(tokens)):
+            latent = model.compose_latents(latent, embeddings[i])
 
     generated = list(seed)
     current_pos = len(tokens)
@@ -661,13 +827,18 @@ def generate(
 
         generated.append(vocab.idx_to_char[next_token])
 
-        # Add position embedding to next token (clamped to max_positions)
-        pos_idx = min(current_pos, model.pos_embedding.num_embeddings - 1)
-        next_token_emb = model.embed(torch.tensor([next_token], dtype=torch.long, device=device))[0]
-        next_pos_emb = model.pos_embedding(torch.tensor([pos_idx], device=device))[0]
-        next_embedding = next_token_emb + next_pos_emb
+        # Get embedding for next token at current position
+        next_tok_t = torch.tensor([next_token], dtype=torch.long, device=device)
+        if is_additive:
+            next_embedding = model.embed_at_position(next_tok_t, current_pos)[0]
+            latent = model.latent_norm(latent + next_embedding)
+        else:
+            pos_idx = min(current_pos, model.pos_embedding.num_embeddings - 1)
+            next_token_emb = model.embed(next_tok_t)[0]
+            next_pos_emb = model.pos_embedding(torch.tensor([pos_idx], device=device))[0]
+            next_embedding = next_token_emb + next_pos_emb
+            latent = model.compose_latents(latent, next_embedding)
 
-        latent = model.compose_latents(latent, next_embedding)
         current_pos += 1
 
     return ''.join(generated)
