@@ -8,6 +8,128 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import numpy as np
+
+
+def log_embedding_visualizations(model, vocab, wandb, epoch, device):
+    """Log embedding similarity heatmap and t-SNE scatter to wandb."""
+    if wandb is None:
+        return
+
+    model.eval()
+    with torch.no_grad():
+        # Get all embeddings
+        all_ids = torch.arange(vocab.vocab_size, device=device)
+        embeddings = model.embed(all_ids).cpu().numpy()  # (vocab_size, d_latent)
+
+        # Get character labels (escape special chars for display)
+        labels = []
+        for i in range(vocab.vocab_size):
+            ch = vocab.idx_to_char[i]
+            if ch == '\n':
+                labels.append('\\n')
+            elif ch == ' ':
+                labels.append('␣')
+            elif ch == '\t':
+                labels.append('\\t')
+            else:
+                labels.append(ch)
+
+        # 1. Cosine similarity heatmap
+        _log_similarity_heatmap(embeddings, labels, wandb, epoch)
+
+        # 2. t-SNE scatter plot
+        _log_tsne_scatter(embeddings, labels, wandb, epoch)
+
+    model.train()
+
+
+def _log_similarity_heatmap(embeddings, labels, wandb, epoch):
+    """Log cosine similarity heatmap of character embeddings."""
+    try:
+        import matplotlib.pyplot as plt
+
+        # Compute cosine similarity
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        normalized = embeddings / (norms + 1e-8)
+        similarity = normalized @ normalized.T  # (vocab_size, vocab_size)
+
+        # Create heatmap
+        fig, ax = plt.subplots(figsize=(12, 10))
+        im = ax.imshow(similarity, cmap='RdBu_r', vmin=-1, vmax=1)
+
+        # Add labels
+        ax.set_xticks(range(len(labels)))
+        ax.set_yticks(range(len(labels)))
+        ax.set_xticklabels(labels, fontsize=6)
+        ax.set_yticklabels(labels, fontsize=6)
+        plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+
+        ax.set_title(f'Character Embedding Cosine Similarity (Epoch {epoch})')
+        fig.colorbar(im, ax=ax, label='Cosine Similarity')
+        plt.tight_layout()
+
+        wandb.log({f'embedding_similarity': wandb.Image(fig)}, step=epoch)
+        plt.close(fig)
+
+    except ImportError:
+        pass  # matplotlib not available
+
+
+def _log_tsne_scatter(embeddings, labels, wandb, epoch):
+    """Log t-SNE visualization of character embeddings."""
+    try:
+        from sklearn.manifold import TSNE
+        import matplotlib.pyplot as plt
+
+        # Run t-SNE
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(labels)-1))
+        coords = tsne.fit_transform(embeddings)
+
+        # Create scatter plot
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        # Color by character type
+        colors = []
+        for label in labels:
+            if label in 'aeiouAEIOU':
+                colors.append('red')  # vowels
+            elif label.isalpha():
+                colors.append('blue')  # consonants
+            elif label.isdigit():
+                colors.append('green')  # digits
+            elif label in '.,!?;:\'"':
+                colors.append('orange')  # punctuation
+            else:
+                colors.append('gray')  # whitespace/other
+
+        ax.scatter(coords[:, 0], coords[:, 1], c=colors, alpha=0.7, s=100)
+
+        # Add labels
+        for i, label in enumerate(labels):
+            ax.annotate(label, (coords[i, 0], coords[i, 1]),
+                       fontsize=8, ha='center', va='center')
+
+        ax.set_title(f't-SNE of Character Embeddings (Epoch {epoch})')
+        ax.set_xlabel('t-SNE 1')
+        ax.set_ylabel('t-SNE 2')
+
+        # Add legend
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='red', label='Vowels'),
+            Patch(facecolor='blue', label='Consonants'),
+            Patch(facecolor='orange', label='Punctuation'),
+            Patch(facecolor='gray', label='Whitespace/Other'),
+        ]
+        ax.legend(handles=legend_elements, loc='upper right')
+
+        plt.tight_layout()
+        wandb.log({f'embedding_tsne': wandb.Image(fig)}, step=epoch)
+        plt.close(fig)
+
+    except ImportError:
+        pass  # sklearn or matplotlib not available
 
 
 class CharVocab:
@@ -275,6 +397,9 @@ def train(
         if vocab is not None:
             sample = _generate_sample(model, vocab, sample_seed, max_length=100, device=device)
             print(f"  Sample: {sample[:80]}...")
+
+            # Log embedding visualizations every epoch
+            log_embedding_visualizations(model, vocab, wandb, epoch + 1, device)
             if wandb:
                 wandb.log({'sample_text': wandb.Html(f'<pre>{sample}</pre>'), 'epoch': epoch + 1})
 
