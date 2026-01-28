@@ -471,22 +471,25 @@ class ChainableMarkovModel(nn.Module):
 
 class AdditiveMarkovModel(nn.Module):
     """
-    Simpler alternative: Position-specific embeddings with additive composition.
+    Position-specific embeddings with interaction MLP.
 
-    Instead of learning compose(a, b) = MLP([a; b]), we simply sum position-specific
-    embeddings. This avoids the information bottleneck of repeated compression.
+    Key insight: Pure addition can't capture interactions between positions.
+    We need a non-linear layer to learn "t at pos 0 AND h at pos 1 → e".
+
+    Architecture:
+        1. Sum position-specific embeddings (preserves all information)
+        2. Apply interaction MLP (learns non-linear relationships)
+        3. Decode to vocabulary
 
     For tokens [t1, t2, t3, t4]:
-        latent = embed_0(t1) + embed_1(t2) + embed_2(t3) + embed_3(t4)
+        summed = embed_0(t1) + embed_1(t2) + embed_2(t3) + embed_3(t4)
+        latent = interaction_mlp(summed)
         output = decode(latent)
 
-    Chainable: To extend, just add embed_n(t_new) to existing latent.
-
-    Benefits:
-    - No information loss (additive, not compressive)
-    - Position-aware by design (separate embeddings per position)
-    - Much simpler - easier to optimize
-    - Fewer parameters than chained MLP approach
+    Benefits over chained composition:
+    - No repeated compression (sum preserves info)
+    - Single MLP application (not n-1 compositions)
+    - Position-aware by design
     """
 
     def __init__(
@@ -510,20 +513,27 @@ class AdditiveMarkovModel(nn.Module):
         # Shared embedding for positions beyond max (fallback for generation)
         self.fallback_embedding = nn.Embedding(vocab_size, d_latent)
 
-        # Layer norm after summing (stabilizes training)
-        self.latent_norm = nn.LayerNorm(d_latent)
-
-        # Decoder: latent → vocab logits
-        # Using a small MLP decoder for expressiveness
-        self.decoder = nn.Sequential(
+        # Interaction MLP: learns non-linear relationships between summed embeddings
+        # This is the key addition - without this, pure addition can't learn AND relationships
+        self.interaction_mlp = nn.Sequential(
+            nn.LayerNorm(d_latent),
             nn.Linear(d_latent, d_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden, d_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_hidden, d_latent),
         )
-        self.decoder_out = nn.Linear(d_latent, vocab_size, bias=False)
-        # Weight tying with position 0 embedding (arbitrary choice, helps generalization)
-        self.decoder_out.weight = self.pos_embeddings[0].weight
+        self.latent_norm = nn.LayerNorm(d_latent)
+
+        # Decoder: latent → vocab logits (no weight tying - doesn't make sense here)
+        self.decoder = nn.Sequential(
+            nn.Linear(d_latent, d_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden, vocab_size),
+        )
 
         self._init_weights()
 
@@ -549,21 +559,21 @@ class AdditiveMarkovModel(nn.Module):
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """Decode latent to vocabulary logits."""
-        hidden = self.decoder(latent)
-        return self.decoder_out(hidden)
+        return self.decoder(latent)
 
     def forward_chain(self, token_sequences: list[list[int]], device: torch.device) -> torch.Tensor:
         """
-        Additive forward pass - sum position-specific embeddings.
+        Additive forward pass with interaction MLP.
 
-        Much simpler than chained composition: just sum embeddings at each position.
+        1. Sum position-specific embeddings (preserves all information)
+        2. Apply interaction MLP (learns non-linear relationships)
         """
         batch_size = len(token_sequences)
         lengths = [len(seq) for seq in token_sequences]
         max_len = max(lengths)
 
-        # Initialize latent as zeros
-        latent = torch.zeros(batch_size, self.d_latent, device=device)
+        # Initialize sum as zeros
+        summed = torch.zeros(batch_size, self.d_latent, device=device)
 
         # Pad sequences
         padded = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
@@ -583,9 +593,10 @@ class AdditiveMarkovModel(nn.Module):
 
             # Mask: only add for sequences that have this position
             mask = (pos < lengths_t).unsqueeze(-1).float()  # (batch, 1)
-            latent = latent + pos_emb * mask
+            summed = summed + pos_emb * mask
 
-        # Normalize the summed latent
+        # Apply interaction MLP to learn non-linear relationships
+        latent = self.interaction_mlp(summed)
         latent = self.latent_norm(latent)
 
         return latent
@@ -602,8 +613,36 @@ class AdditiveMarkovModel(nn.Module):
         return self.pos_embeddings[0]
 
     def compose_latents(self, latent1: torch.Tensor, latent2: torch.Tensor) -> torch.Tensor:
-        """For compatibility - just adds latent2 to latent1."""
-        return self.latent_norm(latent1 + latent2)
+        """For compatibility - adds and applies interaction MLP."""
+        summed = latent1 + latent2
+        return self.latent_norm(self.interaction_mlp(summed))
+
+    def get_raw_sum(self, token_sequences: list[list[int]], device: torch.device) -> torch.Tensor:
+        """Get raw sum of embeddings (before interaction MLP) for incremental generation."""
+        batch_size = len(token_sequences)
+        lengths = [len(seq) for seq in token_sequences]
+        max_len = max(lengths)
+
+        summed = torch.zeros(batch_size, self.d_latent, device=device)
+        padded = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        for i, seq in enumerate(token_sequences):
+            padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+
+        lengths_t = torch.tensor(lengths, device=device)
+
+        for pos in range(max_len):
+            if pos < self.max_positions:
+                pos_emb = self.pos_embeddings[pos](padded[:, pos])
+            else:
+                pos_emb = self.fallback_embedding(padded[:, pos])
+            mask = (pos < lengths_t).unsqueeze(-1).float()
+            summed = summed + pos_emb * mask
+
+        return summed
+
+    def apply_interaction(self, raw_sum: torch.Tensor) -> torch.Tensor:
+        """Apply interaction MLP to raw sum to get latent."""
+        return self.latent_norm(self.interaction_mlp(raw_sum))
 
 
 def train(
@@ -731,12 +770,12 @@ def _generate_sample(model, vocab, seed, max_length=100, temperature=0.8, device
     is_additive = isinstance(model, AdditiveMarkovModel)
 
     if is_additive:
-        # AdditiveMarkovModel: use position-specific embeddings directly
-        latent = torch.zeros(model.d_latent, device=device)
+        # AdditiveMarkovModel: track raw sum, apply interaction MLP for decoding
+        raw_sum = torch.zeros(model.d_latent, device=device)
         for i, tok in enumerate(tokens):
             tok_t = torch.tensor([tok], dtype=torch.long, device=device)
-            latent = latent + model.embed_at_position(tok_t, i)[0]
-        latent = model.latent_norm(latent)
+            raw_sum = raw_sum + model.embed_at_position(tok_t, i)[0]
+        latent = model.apply_interaction(raw_sum)
     else:
         # ChainableMarkovModel: use positional embeddings added to token embeddings
         token_ids = torch.tensor(tokens, dtype=torch.long, device=device)
@@ -747,6 +786,7 @@ def _generate_sample(model, vocab, seed, max_length=100, temperature=0.8, device
         latent = embeddings[0]
         for i in range(1, len(tokens)):
             latent = model.compose_latents(latent, embeddings[i])
+        raw_sum = None  # Not used for chainable
 
     generated = list(seed)
     current_pos = len(tokens)
@@ -760,8 +800,10 @@ def _generate_sample(model, vocab, seed, max_length=100, temperature=0.8, device
         # Get embedding for next token at current position
         next_tok_t = torch.tensor([next_token], dtype=torch.long, device=device)
         if is_additive:
+            # Add to raw sum, then apply interaction MLP
             next_embedding = model.embed_at_position(next_tok_t, current_pos)[0]
-            latent = model.latent_norm(latent + next_embedding)
+            raw_sum = raw_sum + next_embedding
+            latent = model.apply_interaction(raw_sum)
         else:
             pos_idx = min(current_pos, model.pos_embedding.num_embeddings - 1)
             next_token_emb = model.embed(next_tok_t)[0]
@@ -791,12 +833,12 @@ def generate(
     is_additive = isinstance(model, AdditiveMarkovModel)
 
     if is_additive:
-        # AdditiveMarkovModel: sum position-specific embeddings
-        latent = torch.zeros(model.d_latent, device=device)
+        # AdditiveMarkovModel: track raw sum, apply interaction MLP for decoding
+        raw_sum = torch.zeros(model.d_latent, device=device)
         for i, tok in enumerate(tokens):
             tok_t = torch.tensor([tok], dtype=torch.long, device=device)
-            latent = latent + model.embed_at_position(tok_t, i)[0]
-        latent = model.latent_norm(latent)
+            raw_sum = raw_sum + model.embed_at_position(tok_t, i)[0]
+        latent = model.apply_interaction(raw_sum)
     else:
         # ChainableMarkovModel: compose with positional embeddings
         token_ids = torch.tensor(tokens, dtype=torch.long, device=device)
@@ -807,6 +849,7 @@ def generate(
         latent = embeddings[0]
         for i in range(1, len(tokens)):
             latent = model.compose_latents(latent, embeddings[i])
+        raw_sum = None  # Not used for chainable
 
     generated = list(seed)
     current_pos = len(tokens)
@@ -830,8 +873,10 @@ def generate(
         # Get embedding for next token at current position
         next_tok_t = torch.tensor([next_token], dtype=torch.long, device=device)
         if is_additive:
+            # Add to raw sum, then apply interaction MLP
             next_embedding = model.embed_at_position(next_tok_t, current_pos)[0]
-            latent = model.latent_norm(latent + next_embedding)
+            raw_sum = raw_sum + next_embedding
+            latent = model.apply_interaction(raw_sum)
         else:
             pos_idx = min(current_pos, model.pos_embedding.num_embeddings - 1)
             next_token_emb = model.embed(next_tok_t)[0]
