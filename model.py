@@ -88,6 +88,7 @@ class ChainableMarkovModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_hidden, d_latent),
         )
+        self.compose_norm = nn.LayerNorm(d_latent)  # Normalize after residual
 
         self.decoder_hidden = nn.Sequential(
             nn.Linear(d_latent, d_hidden),
@@ -112,8 +113,9 @@ class ChainableMarkovModel(nn.Module):
         return self.embedding(token_ids)
 
     def compose_latents(self, latent1: torch.Tensor, latent2: torch.Tensor) -> torch.Tensor:
+        """Compose with residual connection and layer norm for better gradient flow."""
         combined = torch.cat([latent1, latent2], dim=-1)
-        return self.compose_mlp(combined)
+        return self.compose_norm(latent1 + self.compose_mlp(combined))  # Residual + LayerNorm
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         hidden = self.decoder_hidden(latent)
@@ -211,7 +213,7 @@ def train(
             targets = targets.to(device)
             optimizer.zero_grad()
             logits = model(contexts, device)
-            loss = F.cross_entropy(logits, targets)
+            loss = F.cross_entropy(logits, targets, label_smoothing=0.1)  # Helps generalization
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             optimizer.step()
