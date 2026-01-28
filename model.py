@@ -44,6 +44,9 @@ def log_embedding_visualizations(model, vocab, wandb, epoch, device):
         # 3. 3D point cloud visualization
         _log_3d_embeddings(embeddings, labels, wandb, epoch)
 
+        # 4. Composition operation visualization
+        _log_composition_heatmaps(model, vocab, labels, wandb, epoch, device)
+
     model.train()
 
 
@@ -171,6 +174,100 @@ def _log_3d_embeddings(embeddings, labels, wandb, epoch):
 
     except ImportError:
         pass  # sklearn not available
+
+
+def _log_composition_heatmaps(model, vocab, labels, wandb, epoch, device):
+    """Log heatmaps showing what the compose() operation learned."""
+    try:
+        import matplotlib.pyplot as plt
+        import torch
+
+        vocab_size = vocab.vocab_size
+
+        # Get all embeddings
+        all_ids = torch.arange(vocab_size, device=device)
+        embeddings = model.embed(all_ids)  # (vocab_size, d_latent)
+
+        # Compute compose(i, j) for all pairs and get predictions
+        # This creates a vocab_size x vocab_size grid
+        predictions = np.zeros((vocab_size, vocab_size), dtype=np.int32)
+        confidences = np.zeros((vocab_size, vocab_size), dtype=np.float32)
+
+        for i in range(vocab_size):
+            # Batch process: compose embedding[i] with all embeddings
+            emb_i = embeddings[i].unsqueeze(0).expand(vocab_size, -1)  # (vocab_size, d_latent)
+            composed = model.compose_latents(emb_i, embeddings)  # (vocab_size, d_latent)
+            logits = model.decode(composed)  # (vocab_size, vocab_size)
+            probs = torch.softmax(logits, dim=-1)
+
+            predictions[i] = logits.argmax(dim=-1).cpu().numpy()
+            confidences[i] = probs.max(dim=-1).values.cpu().numpy()
+
+        # 1. Bigram Prediction Heatmap - what char is predicted after bigram (i,j)?
+        fig, ax = plt.subplots(figsize=(14, 12))
+
+        # Use a categorical colormap - we'll show the predicted char as color
+        im = ax.imshow(predictions, cmap='tab20', aspect='auto')
+
+        ax.set_xticks(range(len(labels)))
+        ax.set_yticks(range(len(labels)))
+        ax.set_xticklabels(labels, fontsize=5)
+        ax.set_yticklabels(labels, fontsize=5)
+        plt.setp(ax.get_xticklabels(), rotation=90)
+
+        ax.set_xlabel('Second character (j)')
+        ax.set_ylabel('First character (i)')
+        ax.set_title(f'Bigram Predictions: compose(i,j) → predicted char (Epoch {epoch})')
+
+        plt.tight_layout()
+        wandb.log({'composition_predictions': wandb.Image(fig)}, step=epoch)
+        plt.close(fig)
+
+        # 2. Confidence Heatmap - how confident is the model?
+        fig, ax = plt.subplots(figsize=(14, 12))
+
+        im = ax.imshow(confidences, cmap='viridis', vmin=0, vmax=1)
+        fig.colorbar(im, ax=ax, label='Max Probability')
+
+        ax.set_xticks(range(len(labels)))
+        ax.set_yticks(range(len(labels)))
+        ax.set_xticklabels(labels, fontsize=5)
+        ax.set_yticklabels(labels, fontsize=5)
+        plt.setp(ax.get_xticklabels(), rotation=90)
+
+        ax.set_xlabel('Second character (j)')
+        ax.set_ylabel('First character (i)')
+        ax.set_title(f'Bigram Prediction Confidence (Epoch {epoch})')
+
+        plt.tight_layout()
+        wandb.log({'composition_confidence': wandb.Image(fig)}, step=epoch)
+        plt.close(fig)
+
+        # 3. Log some interesting bigram predictions as a table
+        interesting_bigrams = [
+            ('t', 'h'), ('h', 'e'), ('a', 'n'), ('i', 'n'), ('e', 'r'),
+            ('o', 'u'), ('t', 'o'), ('i', 't'), (' ', 't'), ('\\n', ' '),
+        ]
+        table_data = []
+        for c1, c2 in interesting_bigrams:
+            if c1 in vocab.char_to_idx or c1 == '␣':
+                c1_lookup = ' ' if c1 == '␣' else ('\n' if c1 == '\\n' else c1)
+                c2_lookup = ' ' if c2 == '␣' else ('\n' if c2 == '\\n' else c2)
+                if c1_lookup in vocab.char_to_idx and c2_lookup in vocab.char_to_idx:
+                    i, j = vocab.char_to_idx[c1_lookup], vocab.char_to_idx[c2_lookup]
+                    pred_idx = predictions[i, j]
+                    pred_char = labels[pred_idx]
+                    conf = confidences[i, j]
+                    table_data.append([c1, c2, pred_char, f"{conf:.3f}"])
+
+        if table_data:
+            table = wandb.Table(columns=["Char1", "Char2", "Predicted", "Confidence"], data=table_data)
+            wandb.log({'bigram_predictions_table': table}, step=epoch)
+
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"Warning: composition visualization failed: {e}")
 
 
 class CharVocab:
