@@ -120,15 +120,45 @@ class ChainableMarkovModel(nn.Module):
         return self.decoder_out(hidden)
 
     def forward_chain(self, token_sequences: list[list[int]], device: torch.device) -> torch.Tensor:
-        batch_latents = []
-        for seq in token_sequences:
-            tokens = torch.tensor(seq, dtype=torch.long, device=device)
-            embeddings = self.embed(tokens)
-            latent = embeddings[0]
-            for i in range(1, len(seq)):
-                latent = self.compose_latents(latent, embeddings[i])
-            batch_latents.append(latent)
-        return torch.stack(batch_latents)
+        """
+        Vectorized forward chain - processes entire batch in parallel.
+
+        For sequences of varying lengths (2-5), pads to max length and uses
+        masking to handle the variable composition steps.
+        """
+        batch_size = len(token_sequences)
+        lengths = [len(seq) for seq in token_sequences]
+        max_len = max(lengths)
+
+        # Pad sequences to max length
+        padded = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        for i, seq in enumerate(token_sequences):
+            padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+
+        # Embed all tokens at once: (batch, max_len, d_latent)
+        embeddings = self.embed(padded)
+
+        # Start with first token embedding: (batch, d_latent)
+        latent = embeddings[:, 0, :]
+
+        # Create length tensor for masking
+        lengths_t = torch.tensor(lengths, device=device)
+
+        # Compose step by step across entire batch
+        for pos in range(1, max_len):
+            # Mask: which sequences have a token at this position
+            mask = (pos < lengths_t).unsqueeze(-1)  # (batch, 1)
+
+            # Get next embeddings: (batch, d_latent)
+            next_emb = embeddings[:, pos, :]
+
+            # Compose all pairs in batch
+            new_latent = self.compose_latents(latent, next_emb)
+
+            # Update only sequences that have this position
+            latent = torch.where(mask, new_latent, latent)
+
+        return latent
 
     def forward(self, token_sequences: list[list[int]], device: torch.device) -> torch.Tensor:
         latent = self.forward_chain(token_sequences, device)
@@ -163,12 +193,16 @@ def train(
         except ImportError:
             print("wandb not installed, skipping logging")
 
+    global_step = 0
+    log_every = 500  # Log to wandb every N batches
+
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
         train_steps = 0
+        running_loss = 0.0
 
-        for contexts, targets in train_loader:
+        for batch_idx, (contexts, targets) in enumerate(train_loader):
             targets = targets.to(device)
             optimizer.zero_grad()
             logits = model(contexts, device)
@@ -176,8 +210,20 @@ def train(
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             optimizer.step()
+
             train_loss += loss.item()
+            running_loss += loss.item()
             train_steps += 1
+            global_step += 1
+
+            # Log batch loss frequently
+            if wandb and global_step % log_every == 0:
+                wandb.log({
+                    'batch_loss': running_loss / log_every,
+                    'global_step': global_step,
+                    'epoch': epoch + (batch_idx / len(train_loader)),
+                })
+                running_loss = 0.0
 
         scheduler.step()
         avg_train_loss = train_loss / train_steps
