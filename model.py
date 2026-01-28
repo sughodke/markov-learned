@@ -38,8 +38,11 @@ def log_embedding_visualizations(model, vocab, wandb, epoch, device):
         # 1. Cosine similarity heatmap
         _log_similarity_heatmap(embeddings, labels, wandb, epoch)
 
-        # 2. t-SNE scatter plot
+        # 2. t-SNE scatter plot (2D)
         _log_tsne_scatter(embeddings, labels, wandb, epoch)
+
+        # 3. 3D point cloud visualization
+        _log_3d_embeddings(embeddings, labels, wandb, epoch)
 
     model.train()
 
@@ -130,6 +133,44 @@ def _log_tsne_scatter(embeddings, labels, wandb, epoch):
 
     except ImportError:
         pass  # sklearn or matplotlib not available
+
+
+def _log_3d_embeddings(embeddings, labels, wandb, epoch):
+    """Log 3D point cloud visualization of embeddings using PCA."""
+    try:
+        from sklearn.decomposition import PCA
+
+        # Project to 3D using PCA (faster than t-SNE, good for 3D)
+        pca = PCA(n_components=3)
+        coords_3d = pca.fit_transform(embeddings)
+
+        # Create colors as RGB values (0-255)
+        colors = []
+        for label in labels:
+            if label in 'aeiouAEIOU':
+                colors.append([255, 80, 80])  # red - vowels
+            elif label.isalpha():
+                colors.append([80, 80, 255])  # blue - consonants
+            elif label.isdigit():
+                colors.append([80, 255, 80])  # green - digits
+            elif label in '.,!?;:\'"':
+                colors.append([255, 165, 0])  # orange - punctuation
+            else:
+                colors.append([128, 128, 128])  # gray - whitespace/other
+
+        colors = np.array(colors, dtype=np.uint8)
+
+        # Create point cloud array: (N, 6) with [x, y, z, r, g, b]
+        point_cloud = np.hstack([coords_3d, colors]).astype(np.float32)
+
+        # Log as 3D object
+        wandb.log({
+            'embedding_3d': wandb.Object3D(point_cloud),
+            'pca_variance_explained': sum(pca.explained_variance_ratio_),
+        }, step=epoch)
+
+    except ImportError:
+        pass  # sklearn not available
 
 
 class CharVocab:
