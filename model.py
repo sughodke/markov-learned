@@ -144,13 +144,24 @@ def train(
     lr: float = 3e-4,
     weight_decay: float = 0.01,
     gradient_clip: float = 1.0,
-) -> ChainableMarkovModel:
-    """Training loop with cosine annealing LR schedule."""
+    use_wandb: bool = False,
+) -> tuple[ChainableMarkovModel, dict]:
+    """Training loop with cosine annealing LR schedule. Returns model and history."""
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     best_val_loss = float('inf')
+    history = {'train_loss': [], 'val_loss': [], 'lr': []}
+
+    # Import wandb if requested
+    wandb = None
+    if use_wandb:
+        try:
+            import wandb as wb
+            wandb = wb
+        except ImportError:
+            print("wandb not installed, skipping logging")
 
     for epoch in range(epochs):
         model.train()
@@ -184,6 +195,19 @@ def train(
                 val_steps += 1
 
         avg_val_loss = val_loss / val_steps
+        current_lr = scheduler.get_last_lr()[0]
+
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+        history['lr'].append(current_lr)
+
+        if wandb:
+            wandb.log({
+                'epoch': epoch + 1,
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+                'learning_rate': current_lr,
+            })
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -192,10 +216,10 @@ def train(
         print(f"Epoch {epoch+1:3d}/{epochs} | "
               f"Train Loss: {avg_train_loss:.4f} | "
               f"Val Loss: {avg_val_loss:.4f} | "
-              f"LR: {scheduler.get_last_lr()[0]:.6f}")
+              f"LR: {current_lr:.6f}")
 
     model.load_state_dict(torch.load('markov_model_best.pt', weights_only=True))
-    return model
+    return model, history
 
 
 @torch.no_grad()
