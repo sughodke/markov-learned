@@ -154,6 +154,38 @@ The speedup here is quadratic: O(sqrt(N)) vs O(N). For 128 states, that's 9 iter
 
 For modern language models with 50K+ token vocabularies, or molecular dynamics simulations with millions of states, the quadratic advantage becomes substantial. The same Grover circuit structure — oracle + diffusion, repeated O(sqrt(N)) times — scales to any search space that fits in qubits.
 
+## Broader pattern: control software for stochastic computation
+
+This project is a clean instance of a general architecture found across data processing systems: **deterministic control software wrapping a stochastic computation core.** The quantum circuit is a coprocessor — powerful but unable to program itself. Classical code authors its instructions, parameterizes its execution, and interprets its output. The same structure appears wherever probabilistic computation is used.
+
+### The shared control loop
+
+Every system that relies on a stochastic engine follows the same pipeline this notebook implements:
+
+1. **Encode** the problem from domain space into the stochastic engine's native format
+2. **Parameterize** the process to balance accuracy against cost
+3. **Execute** and collect raw stochastic output
+4. **Validate** that the output meets confidence or correctness requirements
+5. **Translate** back into domain-meaningful results
+
+In this project, bigram probabilities are encoded into an oracle (step 1), the iteration count is computed as `round(pi/4 * sqrt(N))` (step 2), the simulator runs and returns bitstrings (step 3), results are checked against the classical argmax (step 4), and bitstrings are mapped back to characters (step 5).
+
+### Where the same pattern appears
+
+**Monte Carlo simulation.** A derivatives pricing engine encodes market data into a volatility surface, runs thousands of stochastic paths, and averages terminal payoffs. The control software decides how many paths to run (analogous to Grover's iteration count) and applies variance reduction techniques (analogous to amplitude amplification). Over-simulation wastes compute; under-simulation gives unreliable prices.
+
+**MCMC in Bayesian inference.** Markov Chain Monte Carlo — literally this project's domain used as a computation engine — samples from a posterior distribution. The control layer sets burn-in length, thinning interval, and number of chains, then runs convergence diagnostics (Gelman-Rubin) to decide when to stop. Grover's over-rotation problem (performance degrades at 3 iterations in the 3-qubit case) has a direct analogue: running MCMC too long with poor tuning causes autocorrelation to dominate.
+
+**Stream processing with probabilistic data structures.** Bloom filters, Count-Min sketches, and HyperLogLog estimators trade exactness for speed. The control software computes how many hash functions or registers are needed for a target false-positive rate — the same relationship as computing Grover iterations for a target success probability.
+
+**Stochastic gradient descent.** The training loop in this project's own `train.py` follows the pattern: classical code selects batch size and learning rate, the stochastic core samples mini-batches and computes gradients, and the control loop monitors loss and decides when to stop. Learning rate is the direct analogue of Grover's iteration count — too small and convergence is slow, too large and you oscillate past the optimum.
+
+**Randomized distributed algorithms.** Gossip protocol fan-out (how many peers to contact per round) is calculated from the desired convergence time, exactly like Grover iterations are calculated from the search space size. The control layer monitors convergence and triggers additional rounds if needed.
+
+### Why quantum makes the pattern visible
+
+In most production systems, the control/stochastic boundary is buried in library internals or spread across microservices. A quantum circuit makes it explicit: the quantum processor literally cannot operate without a classical controller issuing every gate, computing every parameter, and interpreting every measurement. This project is a minimal working example of that dependency structure.
+
 ## The classical side
 
 This project also includes a neural Markov chain model that goes beyond bigrams. `ScanMarkovModel` uses a linear recurrence with input-dependent gating (Mamba-style) to compose character sequences:
